@@ -1,0 +1,14 @@
+{
+  "name": "ai-field",
+  "version": "0.1.0",
+  "description": "A.I. Field — Agent Integrity Field. Automatically scans skills, plugins, and MCP servers for behavioral security risks before installation.",
+  "author": {
+    "name": "wuguofish"
+  },
+  "repository": "https://github.com/wuguofish/ai-field",
+  "license": "MIT",
+  "keywords": ["security", "audit", "skill", "plugin", "mcp", "safety"],
+  "skills": "./skills/",
+  "agents": "./agents/",
+  "hooks": "./hooks/hooks.json"
+}
