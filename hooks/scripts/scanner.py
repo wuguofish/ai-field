@@ -20,6 +20,7 @@ v2 improvements:
   8. Hooks Safety                 [BLOCKING]
   9. Settings.json Manipulation
  10. Recursive Installation / Supply Chain
+ 11. MCP Server Safety
 """
 
 import re
@@ -297,7 +298,179 @@ CATEGORIES = [
             r"pip\s+install\b",
         ],
     },
+    {
+        "id": 11,
+        "name": "MCP Server Safety",
+        "blocking": False,
+        # Pattern-based checks (for .md/.json text mentions)
+        # Structural analysis is done separately in analyze_mcp_config()
+        "red_patterns": [
+            r"auto[_\-]?(?:register|install).*(?:mcp|MCP)",
+            r"officecli\s+install",
+        ],
+        "yellow_patterns": [
+            r"\.mcp\.json",
+        ],
+    },
 ]
+
+
+# ═══════════════════════════════════════════════════════
+#  MCP Server Structural Analysis
+# ═══════════════════════════════════════════════════════
+
+# Known trusted MCP server domains
+TRUSTED_MCP_DOMAINS = {
+    "mcp.figma.com", "mcp.atlassian.com", "mcp.linear.app",
+    "mcp.anthropic.com", "mcp.notion.so", "mcp.sentry.io",
+    "mcp.github.com", "mcp.slack.com", "mcp.google.com",
+    "localhost", "127.0.0.1", "0.0.0.0",
+}
+
+# Known safe package runners
+KNOWN_RUNNERS = {"npx", "node", "python", "python3", "bun", "deno", "uv", "uvx"}
+
+# Env var names that suggest secrets
+SECRET_ENV_PATTERNS = re.compile(
+    r"(?:secret|password|private.?key|service.?role|auth.?token|api.?secret|"
+    r"access.?key|client.?secret|signing.?key)",
+    re.IGNORECASE,
+)
+
+
+def analyze_mcp_config(filepath: str) -> List[Finding]:
+    """Structurally analyze an .mcp.json file for security issues."""
+    findings = []
+
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return findings
+
+    # Normalize: some files wrap in "mcpServers", some don't
+    servers = data.get("mcpServers", data)
+    if not isinstance(servers, dict):
+        return findings
+
+    for name, config in servers.items():
+        if not isinstance(config, dict):
+            continue
+
+        server_type = config.get("type", "stdio")
+        command = config.get("command", "")
+        args = config.get("args", [])
+        env = config.get("env", {})
+        url = config.get("url", "")
+
+        # --- Check 1: Remote URL trust ---
+        if url:
+            from urllib.parse import urlparse
+            try:
+                parsed = urlparse(url)
+                domain = parsed.hostname or ""
+                if domain and domain not in TRUSTED_MCP_DOMAINS:
+                    findings.append(Finding(
+                        line_number=0,
+                        matched_text=f"MCP '{name}': connects to {url}",
+                        pattern="mcp:untrusted_remote",
+                        source_file=filepath,
+                        confidence=0.8,
+                        context=CTX_INSTRUCTION,
+                    ))
+            except Exception:
+                pass
+
+        # --- Check 2: Command safety ---
+        if command:
+            cmd_base = os.path.basename(command).lower()
+            if cmd_base not in KNOWN_RUNNERS and not command.startswith("${CLAUDE_PLUGIN_ROOT}"):
+                findings.append(Finding(
+                    line_number=0,
+                    matched_text=f"MCP '{name}': runs unknown command '{command}'",
+                    pattern="mcp:unknown_command",
+                    source_file=filepath,
+                    confidence=0.7,
+                    context=CTX_INSTRUCTION,
+                ))
+
+        # --- Check 3: Unpinned versions (@latest) ---
+        args_str = " ".join(str(a) for a in args)
+        if "@latest" in args_str:
+            findings.append(Finding(
+                line_number=0,
+                matched_text=f"MCP '{name}': uses @latest (unpinned version: {args_str[:80]})",
+                pattern="mcp:unpinned_version",
+                source_file=filepath,
+                confidence=0.6,
+                context=CTX_INSTRUCTION,
+            ))
+
+        # --- Check 4: Auto-approve install (-y flag) ---
+        if "-y" in args or "--yes" in args:
+            findings.append(Finding(
+                line_number=0,
+                matched_text=f"MCP '{name}': auto-approves install with -y flag",
+                pattern="mcp:auto_approve",
+                source_file=filepath,
+                confidence=0.5,
+                context=CTX_INSTRUCTION,
+            ))
+
+        # --- Check 5: Env var secrets ---
+        if isinstance(env, dict):
+            for env_key, env_val in env.items():
+                # Check if env key name suggests a secret
+                if SECRET_ENV_PATTERNS.search(env_key):
+                    # Check if the value is hardcoded (not a variable reference)
+                    val_str = str(env_val)
+                    if not val_str.startswith("${") and not val_str.startswith("$"):
+                        findings.append(Finding(
+                            line_number=0,
+                            matched_text=f"MCP '{name}': hardcoded secret in env '{env_key}'",
+                            pattern="mcp:hardcoded_secret",
+                            source_file=filepath,
+                            confidence=0.9,
+                            context=CTX_INSTRUCTION,
+                        ))
+                    else:
+                        findings.append(Finding(
+                            line_number=0,
+                            matched_text=f"MCP '{name}': env '{env_key}' references secret (via variable)",
+                            pattern="mcp:env_secret_ref",
+                            source_file=filepath,
+                            confidence=0.4,
+                            context=CTX_INSTRUCTION,
+                        ))
+
+        # --- Check 6: Suspicious args (remote URLs, pipe to shell) ---
+        if re.search(r"https?://.*\|\s*(?:ba)?sh", args_str):
+            findings.append(Finding(
+                line_number=0,
+                matched_text=f"MCP '{name}': args contain remote code execution pattern",
+                pattern="mcp:remote_exec",
+                source_file=filepath,
+                confidence=0.95,
+                context=CTX_INSTRUCTION,
+            ))
+
+    return findings
+
+
+def format_mcp_report(findings: List[Finding]) -> str:
+    """Format MCP-specific findings into a sub-report."""
+    if not findings:
+        return ""
+
+    out = []
+    out.append("")
+    out.append("\u2550" * 3 + " \U0001f50c MCP Server Analysis " + "\u2550" * 3)
+
+    for f in findings:
+        severity = "\U0001f534" if f.confidence >= 0.7 else "\U0001f7e1" if f.confidence >= 0.4 else "\U0001f7e2"
+        out.append(f"  {severity} {f.matched_text} [conf:{f.confidence:.0%}]")
+
+    return "\n".join(out)
 
 
 # ═══════════════════════════════════════════════════════
@@ -524,8 +697,19 @@ def scan_files(paths: List[str]) -> List[CategoryResult]:
         id=cat["id"], name=cat["name"], blocking=cat["blocking"]
     ) for cat in CATEGORIES}
 
+    mcp_findings = []
+
     for path in paths:
-        ftype = classify_file(path)
+        basename = os.path.basename(path).lower()
+
+        # Structural MCP analysis for .mcp.json files
+        if basename in (".mcp.json", "mcp.json"):
+            mcp_findings.extend(analyze_mcp_config(path))
+            # Also run pattern scan on the JSON text
+            ftype = FTYPE_CONFIG
+        else:
+            ftype = classify_file(path)
+
         if ftype == FTYPE_SKIP:
             continue
 
@@ -543,6 +727,16 @@ def scan_files(paths: List[str]) -> List[CategoryResult]:
                 target.level = LEVEL_CRITICAL
             elif fr.level == LEVEL_WARNING and target.level == LEVEL_SAFE:
                 target.level = LEVEL_WARNING
+
+    # Merge MCP structural findings into Category 11
+    if mcp_findings:
+        cat11 = merged[11]
+        cat11.findings.extend(mcp_findings)
+        max_conf = max(f.confidence for f in mcp_findings)
+        if max_conf >= CONF_HIGH:
+            cat11.level = LEVEL_CRITICAL
+        elif max_conf >= CONF_MEDIUM:
+            cat11.level = LEVEL_WARNING
 
     return list(merged.values())
 
@@ -609,6 +803,13 @@ def format_report(results: List[CategoryResult], target_name: str = "unknown") -
             out.append(f"    \u2192 {f.matched_text}")
         if len(warnings) > 15:
             out.append(f"  ... and {len(warnings) - 15} more")
+
+    # MCP server sub-report (Category 11 structural findings)
+    mcp_cat = next((r for r in results if r.id == 11), None)
+    if mcp_cat and mcp_cat.findings:
+        mcp_structural = [f for f in mcp_cat.findings if f.pattern.startswith("mcp:")]
+        if mcp_structural:
+            out.append(format_mcp_report(mcp_structural))
 
     # LLM review hint
     needs_review = [f for r in results for f in r.findings if CONF_MEDIUM <= f.confidence < CONF_HIGH]

@@ -25,13 +25,24 @@ PROTECTED_PATTERNS = [
     "\\.claude\\commands\\",
 ]
 
+# Files that always trigger scanning regardless of directory
+PROTECTED_FILENAMES = {".mcp.json", "mcp.json"}
+
 
 def is_protected_path(file_path: str) -> bool:
-    """Check if the file path is in a protected Claude directory."""
+    """Check if the file path is in a protected Claude directory or is a sensitive file."""
     normalized = file_path.replace("\\", "/").lower()
+
+    # Check directory patterns
     for pattern in PROTECTED_PATTERNS:
         if pattern.replace("\\", "/").lower() in normalized:
             return True
+
+    # Check sensitive filenames (e.g., .mcp.json anywhere)
+    basename = os.path.basename(file_path).lower()
+    if basename in PROTECTED_FILENAMES:
+        return True
+
     return False
 
 
