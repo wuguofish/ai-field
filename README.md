@@ -219,7 +219,7 @@ MIT
 
 # 繁體中文
 
-**A.I. Field — Agent Integrity Field**，保護你的 AI Agent 免受 Angel Attack。
+**A.I. Field — Agent Integrity Field**，如同 AT 力場一般保護你的 AI Agent 免受使徒來襲。
 
 > [English](#ai-field) | 繁體中文
 
