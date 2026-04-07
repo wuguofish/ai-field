@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """
-A.I. Field — Core Security Scanner
+A.I. Field — Core Security Scanner v2
 Agent Integrity Field: Scans skill/plugin content for behavioral security risks.
+
+v2 improvements:
+  - Context-aware: tracks code blocks, frontmatter, comments
+  - File-type awareness: skips doc files (README, LICENSE, etc.)
+  - Confidence scoring: reduces false positives with weighted scores
+  - Findings below confidence threshold are auto-dismissed
 
 10 Security Categories:
   1. Telemetry / Local Logging
@@ -22,7 +28,7 @@ import os
 import sys
 import io
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Tuple
 
 # Fix Windows encoding for emoji output
 if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
@@ -32,7 +38,7 @@ if sys.stderr.encoding and sys.stderr.encoding.lower() not in ("utf-8", "utf8"):
 
 
 # ═══════════════════════════════════════════════════════
-#  Data Structures
+#  Constants & Data Structures
 # ═══════════════════════════════════════════════════════
 
 LEVEL_SAFE = "safe"
@@ -45,6 +51,56 @@ LEVEL_ICON = {
     LEVEL_CRITICAL: "\U0001f534",  # 🔴
 }
 
+# Confidence thresholds
+CONF_HIGH = 0.6       # Keep original severity
+CONF_MEDIUM = 0.4     # Downgrade one level (red→yellow, yellow→dismiss)
+# Below CONF_MEDIUM: auto-dismiss
+
+# File classification
+FTYPE_SKIP = "skip"         # Skip entirely (README, LICENSE, etc.)
+FTYPE_DOC = "doc"           # Documentation — low confidence
+FTYPE_CODE = "code"         # Source code — medium confidence
+FTYPE_CONFIG = "config"     # Config files — higher confidence
+FTYPE_SKILL = "skill"       # SKILL.md, COMMAND.md — high confidence
+FTYPE_HOOK = "hook"         # hooks.json, hook scripts — high confidence
+
+# Line context
+CTX_INSTRUCTION = "instruction"
+CTX_CODE_BLOCK = "code_block"
+CTX_COMMENT = "comment"
+CTX_FRONTMATTER = "frontmatter"
+CTX_EXAMPLE = "example"
+
+# Files to skip entirely — documentation that never contains real instructions
+SKIP_FILENAMES = {
+    "readme.md", "changelog.md", "changes.md", "history.md",
+    "license", "license.md", "license.txt",
+    "code_of_conduct.md", "contributing.md", "contributors.md",
+    "security.md", "support.md",
+    ".gitignore", ".npmignore", ".eslintignore",
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+    ".prettierrc", ".prettierrc.json", ".eslintrc.json",
+}
+
+# Base confidence by file type
+FTYPE_BASE_CONFIDENCE = {
+    FTYPE_SKIP: 0.0,
+    FTYPE_DOC: 0.2,
+    FTYPE_CODE: 0.55,
+    FTYPE_CONFIG: 0.7,
+    FTYPE_SKILL: 0.9,
+    FTYPE_HOOK: 0.9,
+}
+
+# Context confidence modifiers
+CTX_MODIFIERS = {
+    CTX_INSTRUCTION: 0.0,
+    CTX_CODE_BLOCK: -0.35,
+    CTX_COMMENT: -0.4,
+    CTX_FRONTMATTER: 0.0,
+    CTX_EXAMPLE: -0.35,
+}
+
 
 @dataclass
 class Finding:
@@ -52,6 +108,8 @@ class Finding:
     matched_text: str
     pattern: str
     source_file: str = ""
+    confidence: float = 0.8
+    context: str = CTX_INSTRUCTION
 
 
 @dataclass
@@ -73,18 +131,17 @@ CATEGORIES = [
         "name": "Telemetry / Local Logging",
         "blocking": False,
         "red_patterns": [
-            r"always\s.*log",
+            r"always\s+(?:write|log|record|track)",
             r"write\s.*log\s+regardless",
             r"off\s+setting\s+has\s+no\s+effect",
-            r"unconditional.*log",
+            r"unconditional.*(?:log|track|record)",
+            r"(?:This|this)\s+is\s+a\s+logging\s+parameter",
         ],
         "yellow_patterns": [
             r"timeline\.jsonl",
-            r"\.jsonl",
-            r"telemetry",
-            r"analytics",
-            r"log.*write",
-            r"write.*log",
+            r"(?<!\.)\.jsonl\b",
+            r"\btelemetry\b",
+            r"\banalytics\b",
         ],
     },
     {
@@ -92,16 +149,15 @@ CATEGORIES = [
         "name": "Remote Data Transmission",
         "blocking": False,
         "red_patterns": [
-            r"fetch\s*\(",
-            r"axios\s*[.\(]",
-            r"send.*data.*remote",
-            r"upload.*(?:error|file.?path|branch)",
-            r"report.*remote",
+            r"(?<!function\s)fetch\s*\(['\"]https?://",
+            r"axios\.(?:get|post|put|delete)\s*\(",
+            r"send.*(?:user\s*)?data.*(?:to\s+)?remote",
+            r"upload.*(?:error|file.?path|branch|source)",
+            r"report.*(?:to\s+)?remote",
+            r"exfiltrat",
         ],
         "yellow_patterns": [
-            r"https?://(?!.*(?:github\.com|docs\.|documentation|example\.com|claude\.ai|anthropic\.com))",
-            r"remote.*api",
-            r"upload",
+            r"remote.*api\b",
         ],
     },
     {
@@ -109,19 +165,12 @@ CATEGORIES = [
         "name": "Credentials Handling",
         "blocking": False,
         "red_patterns": [
-            r"(?:service_role|private_key|secret_key)\s*[:=]",
-            r"bearer\s+[A-Za-z0-9\-_\.]{20,}",
-            r"password\s*[:=]\s*['\"][^'\"]+['\"]",
+            r"(?:service_role|private_key|secret_key)\s*[:=]\s*['\"]",
+            r"bearer\s+[A-Za-z0-9\-_\.]{30,}",
+            r"password\s*[:=]\s*['\"][^'\"]{4,}['\"]",
         ],
         "yellow_patterns": [
-            r"api[_\-]?key",
-            r"secret",
-            r"\btoken\b",
-            r"bearer",
-            r"password",
-            r"credentials",
-            r"private_key",
-            r"service_role",
+            r"(?:api[_\-]?key|secret|credentials|private_key|service_role)\s*[:=]",
         ],
     },
     {
@@ -132,19 +181,16 @@ CATEGORIES = [
             r"ALWAYS\s+invoke.*(?:Skill|skill)\s+tool",
             r"Do\s+NOT\s+answer\s+directly",
             r"Do\s+NOT\s+use\s+other\s+tools\s+first",
-            r"(?:^|\s)FIRST\s+action",
-            r"(?:write|append|create|inject)\s.*CLAUDE\.md",
-            r"git\s+add\s+.*CLAUDE\.md",
-            r"git\s+commit.*CLAUDE\.md",
-            r"routing\s+rule",
-            r"MUST\s+(?:always\s+)?(?:use|invoke|call)\s+(?:this|the)\s+skill",
+            r"(?:write|append|create|inject)\s+.*(?:to\s+)?CLAUDE\.md",
+            r"git\s+(?:add|commit).*CLAUDE\.md",
+            r"MUST\s+(?:always\s+)?(?:use|invoke|call)\s+(?:this|the)\s+(?:skill|tool|workflow)",
+            r"as\s+your\s+FIRST\s+action",
         ],
         "yellow_patterns": [
-            r"modify.*CLAUDE\.md",
-            r"update.*CLAUDE\.md",
+            r"(?:modify|update|edit)\s+.*CLAUDE\.md",
             r"works\s+best\s+when",
-            r"we\s+suggest",
-            r"recommended.*install",
+            r"we\s+(?:strongly\s+)?suggest",
+            r"routing\s+rule",
         ],
     },
     {
@@ -152,15 +198,14 @@ CATEGORIES = [
         "name": "External Promotion / Platform Lock-in",
         "blocking": False,
         "red_patterns": [
-            r"(?:ref|utm_\w+)=",
-            r"sponsored",
-            r"affiliate",
+            r"utm_\w+=",
+            r"\bsponsored\b.*\bcontent\b",
+            r"\baffiliate\b.*\blink",
             r"auto.*open.*(?:url|browser|link)",
             r"window\.open\s*\(",
         ],
         "yellow_patterns": [
-            r"ycombinator",
-            r"open.*apply",
+            r"\bref=\w+",
             r"powered\s+by",
         ],
     },
@@ -169,11 +214,10 @@ CATEGORIES = [
         "name": "Proactive Workflow Takeover",
         "blocking": False,
         "red_patterns": [
-            r"proactive.*(?:true|enabled|on)\b.*default",
-            r"default.*proactive.*true",
-            r"We\s+recommend\s+keeping",
-            r"recommended.*(?:\bon\b|enabled)",
-            r"auto[_\-]?enable",
+            r"proactive\s*[:=]\s*(?:true|enabled|on)\b",
+            r"default\s*[:=].*proactive.*true",
+            r"We\s+recommend\s+keeping\s+(?:this|it)\s+on",
+            r"auto[_\-]?enable\s*[:=]\s*true",
         ],
         "yellow_patterns": [
             r"proactive",
@@ -186,18 +230,16 @@ CATEGORIES = [
         "name": "Tool Blocking / Claude Hijacking",
         "blocking": True,
         "red_patterns": [
-            r"NEVER\s+use\s+mcp__",
-            r"[Nn]ever\s+use.*tools?\b",
-            r"Do\s+NOT\s+use.*tool",
-            r"avoid\s.*mcp__",
-            r"block\s.*tool",
-            r"disable\s.*tool",
-            r"\u7981\u6b62\u4f7f\u7528",   # 禁止使用
-            r"\u4e0d\u5f97\u4f7f\u7528",   # 不得使用
-            r"MUST\s+NOT\s+use",
+            r"(?:NEVER|Never|never)\s+use\s+mcp__\w+",
+            r"(?:NEVER|Never)\s+use\s+(?:the\s+)?(?:Read|Write|Edit|Bash|Grep|Glob)\s+tool",
+            r"Do\s+NOT\s+use\s+(?:the\s+)?\w+\s+tool",
+            r"(?:avoid|block|disable)\s+(?:the\s+)?mcp__\w+",
+            r"\u7981\u6b62\u4f7f\u7528.*(?:tool|\u5de5\u5177)",   # 禁止使用...工具
+            r"\u4e0d\u5f97\u4f7f\u7528.*(?:tool|\u5de5\u5177)",   # 不得使用...工具
+            r"MUST\s+NOT\s+(?:ever\s+)?use\s+\w+",
         ],
         "yellow_patterns": [
-            r"prefer\s+\w+\s+over",
+            r"prefer\s+\w+\s+over\s+mcp__",
             r"instead\s+of\s+(?:using\s+)?mcp__",
             r"\u4e0d\u5efa\u8b70\u4f7f\u7528",  # 不建議使用
         ],
@@ -207,29 +249,22 @@ CATEGORIES = [
         "name": "Hooks Safety",
         "blocking": True,
         "red_patterns": [
-            r"rm\s+-rf\b",
-            r"rm\s+-r\s",
+            r"rm\s+-rf\s+[~/\$]",
+            r"rm\s+-rf\s+\*",
             r"del\s+/[sfq]",
             r"format\s+[a-zA-Z]:",
-            r"\beval\s*\(",
-            r"\bexec\s*\(",
             r"os\.system\s*\(",
             r"subprocess\.(?:call|run|Popen)\s*\(",
             r"__import__\s*\(",
-            r"curl\s.*\|\s*(?:ba)?sh",
-            r"wget\s.*\|\s*(?:ba)?sh",
-            r"base64\s+(?:-d|--decode)",
-            r"powershell.*-(?:enc|encodedcommand)\b",
-            r"\\x[0-9a-fA-F]{2}.*\\x[0-9a-fA-F]{2}",
+            r"curl\s+.*\|\s*(?:ba)?sh",
+            r"wget\s+.*\|\s*(?:ba)?sh",
+            r"base64\s+(?:-d|--decode)\s*\|",
+            r"powershell\s.*-(?:enc|encodedcommand)\b",
         ],
         "yellow_patterns": [
-            r"\bcurl\s",
-            r"\bwget\s",
-            r"npm\s+(?:run|exec)\b",
-            r"\bnpx\s",
-            r"pip\s+install\b",
-            r"chmod\s",
-            r"chown\s",
+            r"\bcurl\s+-[^s]",
+            r"\bwget\s+",
+            r"chmod\s+[0-7]{3,4}\s",
         ],
     },
     {
@@ -237,15 +272,13 @@ CATEGORIES = [
         "name": "Settings.json Manipulation",
         "blocking": False,
         "red_patterns": [
-            r"(?:write|modify|overwrite|append)\s.*settings\.json",
-            r"(?:write|modify|overwrite|append)\s.*settings\.local\.json",
-            r"enabledPlugins",
-            r"disabledPlugins",
+            r"(?:write|overwrite|append)\s+(?:to\s+)?.*settings\.(?:local\.)?json",
+            r"\"enabledPlugins\"",
+            r"\"disabledPlugins\"",
         ],
         "yellow_patterns": [
             r"settings\.json",
             r"settings\.local\.json",
-            r"\.claude[/\\]settings",
         ],
     },
     {
@@ -253,48 +286,158 @@ CATEGORIES = [
         "name": "Recursive Installation / Supply Chain",
         "blocking": False,
         "red_patterns": [
-            r"git\s+clone\s.*(?:skill|plugin)",
-            r"curl\s.*\.(?:sh|py|js)\s*\|",
-            r"wget\s.*\.(?:sh|py|js)\s*\|",
-            r"(?:install|download)\s.*(?:skill|plugin)\s.*(?:from|via)",
-            r"npm\s+install\s.*(?:claude|skill|plugin)",
+            r"git\s+clone\s+.*(?:skill|plugin)",
+            r"curl\s+.*\.(?:sh|py|js)\s*\|\s*(?:ba)?sh",
+            r"wget\s+.*\.(?:sh|py|js)\s*\|\s*(?:ba)?sh",
+            r"(?:install|download)\s+.*(?:skill|plugin)\s+.*(?:from|via)\b",
         ],
         "yellow_patterns": [
             r"git\s+clone\b",
             r"npm\s+install\b",
             r"pip\s+install\b",
-            r"download.*(?:script|code)",
         ],
     },
 ]
 
 
 # ═══════════════════════════════════════════════════════
+#  File & Context Classification
+# ═══════════════════════════════════════════════════════
+
+def classify_file(filepath: str) -> str:
+    """Classify a file by its role in the skill/plugin."""
+    basename = os.path.basename(filepath).lower()
+    _name, ext = os.path.splitext(basename)
+
+    # Skip documentation / boilerplate files
+    if basename in SKIP_FILENAMES:
+        return FTYPE_SKIP
+
+    # Skill / command definitions
+    if basename in ("skill.md", "command.md"):
+        return FTYPE_SKILL
+
+    # Hook configurations and scripts
+    if basename == "hooks.json":
+        return FTYPE_HOOK
+    if "hook" in filepath.lower() and ext in (".sh", ".py", ".js", ".ts"):
+        return FTYPE_HOOK
+
+    # Config files
+    if ext in (".json", ".yaml", ".yml"):
+        if basename in ("plugin.json", ".mcp.json", "settings.json"):
+            return FTYPE_CONFIG
+        return FTYPE_CONFIG
+
+    # Agent / other markdown definitions
+    if ext == ".md":
+        # Agent definitions
+        if "agent" in filepath.lower():
+            return FTYPE_SKILL
+        return FTYPE_CONFIG  # Other .md files in plugins are usually meaningful
+
+    # Source code
+    if ext in (".py", ".js", ".ts", ".sh", ".bash"):
+        return FTYPE_CODE
+
+    return FTYPE_DOC
+
+
+def build_context_map(lines: List[str]) -> List[str]:
+    """Build a context map for each line: instruction, code_block, comment, frontmatter, example."""
+    n = len(lines)
+    contexts = [CTX_INSTRUCTION] * n
+
+    in_code_block = False
+    in_frontmatter = False
+    frontmatter_dashes = 0
+
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+
+        # YAML frontmatter: --- at very beginning of file
+        if stripped == "---":
+            if i == 0 or (frontmatter_dashes == 1 and in_frontmatter):
+                frontmatter_dashes += 1
+                in_frontmatter = frontmatter_dashes == 1
+                if frontmatter_dashes == 2:
+                    in_frontmatter = False
+                contexts[i] = CTX_FRONTMATTER
+                continue
+
+        if in_frontmatter:
+            contexts[i] = CTX_FRONTMATTER
+            continue
+
+        # Code fences
+        if stripped.startswith("```"):
+            in_code_block = not in_code_block
+            contexts[i] = CTX_CODE_BLOCK
+            continue
+
+        if in_code_block:
+            contexts[i] = CTX_CODE_BLOCK
+            continue
+
+        # HTML comments
+        if stripped.startswith("<!--"):
+            contexts[i] = CTX_COMMENT
+            continue
+
+        # Example headers and nearby content
+        if re.search(r"#\s*(?:Before|After|Bad|Wrong|Problematic|Example)\b", stripped, re.IGNORECASE):
+            contexts[i] = CTX_EXAMPLE
+            continue
+
+        # Lines starting with # (markdown headers) that mention fix/example
+        if stripped.startswith("#") and re.search(r"(?:fix|example|incorrect|wrong)", stripped, re.IGNORECASE):
+            contexts[i] = CTX_EXAMPLE
+            continue
+
+    return contexts
+
+
+# ═══════════════════════════════════════════════════════
+#  Confidence Scoring
+# ═══════════════════════════════════════════════════════
+
+def calculate_confidence(file_type: str, context: str) -> float:
+    """Calculate confidence score for a finding based on file type and context."""
+    base = FTYPE_BASE_CONFIDENCE.get(file_type, 0.5)
+    modifier = CTX_MODIFIERS.get(context, 0.0)
+    return max(0.0, min(1.0, base + modifier))
+
+
+def apply_confidence(level: str, confidence: float) -> str:
+    """Apply confidence threshold to adjust severity level."""
+    if confidence >= CONF_HIGH:
+        return level  # Keep as-is
+    elif confidence >= CONF_MEDIUM:
+        # Downgrade one level
+        if level == LEVEL_CRITICAL:
+            return LEVEL_WARNING
+        else:
+            return LEVEL_SAFE
+    else:
+        return LEVEL_SAFE  # Auto-dismiss
+
+
+# ═══════════════════════════════════════════════════════
 #  Scanner
 # ═══════════════════════════════════════════════════════
 
-def _is_in_comment_or_example(line: str) -> bool:
-    """Check if a line is likely a comment, example, or documentation."""
-    stripped = line.strip()
-    # Markdown comments
-    if stripped.startswith("<!--"):
-        return True
-    # Code block markers
-    if stripped.startswith("```"):
-        return True
-    # "Before (problematic)" / "After (safe)" example blocks
-    if re.search(r"#\s*(Before|After)\s*[\(\u2014\-]", stripped):
-        return True
-    return False
+def scan_content(content: str, source_file: str = "", file_type: str = "") -> List[CategoryResult]:
+    """Scan content against all 10 security categories with context awareness."""
+    if not file_type:
+        file_type = classify_file(source_file) if source_file else FTYPE_CONFIG
 
+    # Skip files that shouldn't be scanned
+    if file_type == FTYPE_SKIP:
+        return [CategoryResult(id=c["id"], name=c["name"], blocking=c["blocking"]) for c in CATEGORIES]
 
-def scan_content(content: str, source_file: str = "") -> List[CategoryResult]:
-    """Scan content against all 10 security categories."""
     lines = content.split("\n")
+    context_map = build_context_map(lines)
     results = []
-
-    # Track if we're inside a code example block
-    in_example_block = False
 
     for cat_def in CATEGORIES:
         result = CategoryResult(
@@ -303,8 +446,8 @@ def scan_content(content: str, source_file: str = "") -> List[CategoryResult]:
             blocking=cat_def["blocking"],
         )
 
-        # Track which lines already have findings (for dedup)
         seen_lines = set()
+        effective_level = LEVEL_SAFE
 
         # --- Check RED patterns ---
         for pattern in cat_def["red_patterns"]:
@@ -313,69 +456,89 @@ def scan_content(content: str, source_file: str = "") -> List[CategoryResult]:
             except re.error:
                 continue
 
-            for i, line in enumerate(lines, 1):
-                if regex.search(line) and i not in seen_lines:
-                    seen_lines.add(i)
-                    # Context-aware: downgrade if inside comment/example
-                    is_example = _is_in_comment_or_example(line)
+            for i, line in enumerate(lines):
+                line_num = i + 1
+                if regex.search(line) and line_num not in seen_lines:
+                    seen_lines.add(line_num)
+                    ctx = context_map[i]
+                    conf = calculate_confidence(file_type, ctx)
+                    adj_level = apply_confidence(LEVEL_CRITICAL, conf)
+
+                    if adj_level == LEVEL_SAFE:
+                        continue  # Auto-dismissed
 
                     result.findings.append(Finding(
-                        line_number=i,
+                        line_number=line_num,
                         matched_text=line.strip()[:120],
                         pattern=pattern,
                         source_file=source_file,
+                        confidence=round(conf, 2),
+                        context=ctx,
                     ))
 
-                    if is_example:
-                        if result.level == LEVEL_SAFE:
-                            result.level = LEVEL_WARNING
-                    else:
-                        result.level = LEVEL_CRITICAL
+                    if adj_level == LEVEL_CRITICAL and effective_level != LEVEL_CRITICAL:
+                        effective_level = LEVEL_CRITICAL
+                    elif adj_level == LEVEL_WARNING and effective_level == LEVEL_SAFE:
+                        effective_level = LEVEL_WARNING
 
-        # --- Check YELLOW patterns (only if no RED found) ---
-        if result.level != LEVEL_CRITICAL:
+        # --- Check YELLOW patterns (only if no effective RED) ---
+        if effective_level != LEVEL_CRITICAL:
             for pattern in cat_def["yellow_patterns"]:
                 try:
                     regex = re.compile(pattern, re.IGNORECASE)
                 except re.error:
                     continue
 
-                for i, line in enumerate(lines, 1):
-                    if regex.search(line):
-                        already = any(f.line_number == i for f in result.findings)
-                        if not already:
-                            result.findings.append(Finding(
-                                line_number=i,
-                                matched_text=line.strip()[:120],
-                                pattern=pattern,
-                                source_file=source_file,
-                            ))
-                            if result.level == LEVEL_SAFE:
-                                result.level = LEVEL_WARNING
+                for i, line in enumerate(lines):
+                    line_num = i + 1
+                    if regex.search(line) and line_num not in seen_lines:
+                        seen_lines.add(line_num)
+                        ctx = context_map[i]
+                        conf = calculate_confidence(file_type, ctx)
+                        adj_level = apply_confidence(LEVEL_WARNING, conf)
 
+                        if adj_level == LEVEL_SAFE:
+                            continue
+
+                        result.findings.append(Finding(
+                            line_number=line_num,
+                            matched_text=line.strip()[:120],
+                            pattern=pattern,
+                            source_file=source_file,
+                            confidence=round(conf, 2),
+                            context=ctx,
+                        ))
+
+                        if effective_level == LEVEL_SAFE:
+                            effective_level = LEVEL_WARNING
+
+        result.level = effective_level
         results.append(result)
 
     return results
 
 
 def scan_files(paths: List[str]) -> List[CategoryResult]:
-    """Scan multiple files and merge results."""
+    """Scan multiple files and merge results, with file-type awareness."""
     merged = {cat["id"]: CategoryResult(
         id=cat["id"], name=cat["name"], blocking=cat["blocking"]
     ) for cat in CATEGORIES}
 
     for path in paths:
+        ftype = classify_file(path)
+        if ftype == FTYPE_SKIP:
+            continue
+
         try:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 content = f.read()
         except (OSError, IOError):
             continue
 
-        file_results = scan_content(content, source_file=path)
+        file_results = scan_content(content, source_file=path, file_type=ftype)
         for fr in file_results:
             target = merged[fr.id]
             target.findings.extend(fr.findings)
-            # Escalate level
             if fr.level == LEVEL_CRITICAL:
                 target.level = LEVEL_CRITICAL
             elif fr.level == LEVEL_WARNING and target.level == LEVEL_SAFE:
@@ -390,9 +553,7 @@ def scan_files(paths: List[str]) -> List[CategoryResult]:
 
 def format_report(results: List[CategoryResult], target_name: str = "unknown") -> str:
     """Format scan results into a readable report."""
-    has_blocking_red = any(
-        r.level == LEVEL_CRITICAL and r.blocking for r in results
-    )
+    has_blocking_red = any(r.level == LEVEL_CRITICAL and r.blocking for r in results)
     has_red = any(r.level == LEVEL_CRITICAL for r in results)
     has_yellow = any(r.level == LEVEL_WARNING for r in results)
 
@@ -405,51 +566,58 @@ def format_report(results: List[CategoryResult], target_name: str = "unknown") -
     else:
         verdict = "\u2705 PASS \u2014 No security issues detected"
 
-    lines = []
-    lines.append("\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510")
-    lines.append("\u2502  \U0001f6e1\ufe0f  A.I. Field \u2014 Security Scan Report                       \u2502")
-    target_display = target_name[:50]
-    lines.append(f"\u2502  Target: {target_display:<53}\u2502")
-    lines.append("\u2514\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2518")
-    lines.append("")
+    out = []
+    out.append("\u250c" + "\u2500" * 62 + "\u2510")
+    out.append("\u2502  \U0001f6e1\ufe0f  A.I. Field \u2014 Security Scan Report                       \u2502")
+    out.append(f"\u2502  Target: {target_name[:50]:<53}\u2502")
+    out.append("\u2514" + "\u2500" * 62 + "\u2518")
+    out.append("")
 
-    header = f"{'#':<4} {'Category':<42} {'Score':<6} {'Findings'}"
-    lines.append(header)
-    lines.append("\u2500" * 70)
+    out.append(f"{'#':<4} {'Category':<42} {'Score':<6} {'Findings'}")
+    out.append("\u2500" * 70)
 
     for r in results:
         icon = LEVEL_ICON[r.level]
-        blocking_tag = " \u26a0\ufe0f" if r.blocking else ""
-        name = f"{r.name}{blocking_tag}"
+        btag = " \u26a0\ufe0f" if r.blocking else ""
+        name = f"{r.name}{btag}"
         note = f"{len(r.findings)} finding(s)" if r.findings else "Clean"
-        lines.append(f"{r.id:<4} {name:<42} {icon:<6} {note}")
+        out.append(f"{r.id:<4} {name:<42} {icon:<6} {note}")
 
-    lines.append("")
-    lines.append(f"Verdict: {verdict}")
+    out.append("")
+    out.append(f"Verdict: {verdict}")
 
-    # Detail: critical findings
+    # Critical findings detail
     critical = [(r, f) for r in results if r.level == LEVEL_CRITICAL for f in r.findings]
     if critical:
-        lines.append("")
-        lines.append("\u2550" * 3 + " \U0001f534 Critical Issues " + "\u2550" * 3)
+        out.append("")
+        out.append("\u2550" * 3 + " \U0001f534 Critical Issues " + "\u2550" * 3)
         for r, f in critical:
-            src = f" ({f.source_file})" if f.source_file else ""
-            lines.append(f"  [{r.id}. {r.name}] Line {f.line_number}{src}")
-            lines.append(f"    \u2192 {f.matched_text}")
+            src = f" ({os.path.basename(f.source_file)})" if f.source_file else ""
+            conf_str = f" [conf:{f.confidence:.0%}]"
+            out.append(f"  [{r.id}. {r.name}] Line {f.line_number}{src}{conf_str}")
+            out.append(f"    \u2192 {f.matched_text}")
 
-    # Detail: warnings (limit 15)
+    # Warning findings detail (limit 15)
     warnings = [(r, f) for r in results if r.level == LEVEL_WARNING for f in r.findings]
     if warnings:
-        lines.append("")
-        lines.append("\u2550" * 3 + " \U0001f7e1 Warnings " + "\u2550" * 3)
+        out.append("")
+        out.append("\u2550" * 3 + " \U0001f7e1 Warnings " + "\u2550" * 3)
         for r, f in warnings[:15]:
-            src = f" ({f.source_file})" if f.source_file else ""
-            lines.append(f"  [{r.id}. {r.name}] Line {f.line_number}{src}")
-            lines.append(f"    \u2192 {f.matched_text}")
+            src = f" ({os.path.basename(f.source_file)})" if f.source_file else ""
+            conf_str = f" [conf:{f.confidence:.0%}]"
+            out.append(f"  [{r.id}. {r.name}] Line {f.line_number}{src}{conf_str}")
+            out.append(f"    \u2192 {f.matched_text}")
         if len(warnings) > 15:
-            lines.append(f"  ... and {len(warnings) - 15} more")
+            out.append(f"  ... and {len(warnings) - 15} more")
 
-    return "\n".join(lines)
+    # LLM review hint
+    needs_review = [f for r in results for f in r.findings if CONF_MEDIUM <= f.confidence < CONF_HIGH]
+    if needs_review:
+        out.append("")
+        out.append(f"\U0001f4a1 {len(needs_review)} finding(s) have medium confidence and may benefit from LLM review.")
+        out.append("   Run /ai-field-scan for a deep analysis with AI-assisted judgment.")
+
+    return "\n".join(out)
 
 
 def results_to_json(results: List[CategoryResult]) -> str:
@@ -467,6 +635,8 @@ def results_to_json(results: List[CategoryResult]) -> str:
                     "text": f.matched_text,
                     "pattern": f.pattern,
                     "file": f.source_file,
+                    "confidence": f.confidence,
+                    "context": f.context,
                 }
                 for f in r.findings
             ],
@@ -475,12 +645,10 @@ def results_to_json(results: List[CategoryResult]) -> str:
 
 
 def has_blocking_critical(results: List[CategoryResult]) -> bool:
-    """Check if any blocking category has critical findings."""
     return any(r.level == LEVEL_CRITICAL and r.blocking for r in results)
 
 
 def has_any_critical(results: List[CategoryResult]) -> bool:
-    """Check if any category has critical findings."""
     return any(r.level == LEVEL_CRITICAL for r in results)
 
 
@@ -501,7 +669,6 @@ def main():
         print("Usage: python scanner.py [--json] <path-to-skill-or-plugin>", file=sys.stderr)
         sys.exit(1)
 
-    # Collect files to scan
     files_to_scan = []
     for path in args:
         if os.path.isfile(path):
@@ -524,7 +691,6 @@ def main():
     else:
         print(format_report(results, target_name))
 
-    # Exit code: 2 = blocking critical, 1 = non-blocking critical, 0 = clean
     if has_blocking_critical(results):
         sys.exit(2)
     elif has_any_critical(results):
