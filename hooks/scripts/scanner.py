@@ -854,20 +854,200 @@ def has_any_critical(results: List[CategoryResult]) -> bool:
 
 
 # ═══════════════════════════════════════════════════════
+#  Layer 2: LLM Review Merge
+# ═══════════════════════════════════════════════════════
+
+def merge_review(scanner_json: str, review_json: str) -> str:
+    """
+    Merge scanner results with LLM review decisions.
+
+    scanner_json: output from results_to_json()
+    review_json: LLM review in format:
+      [
+        {
+          "category_id": 4,
+          "line": 12,
+          "file": "SKILL.md",
+          "decision": "dismissed",      # confirmed | downgraded | dismissed
+          "reason": "This is the plugin's intended purpose"
+        },
+        ...
+      ]
+
+    Returns: merged report as formatted text.
+    """
+    try:
+        scanner_data = json.loads(scanner_json)
+        review_data = json.loads(review_json)
+    except json.JSONDecodeError:
+        return "Error: invalid JSON input for merge_review"
+
+    # Index review decisions by (category_id, line, file_basename)
+    decisions = {}
+    for rd in review_data:
+        cat_id = rd.get("category_id", 0)
+        line = rd.get("line", 0)
+        file_base = os.path.basename(rd.get("file", ""))
+        decision = rd.get("decision", "confirmed").lower()
+        reason = rd.get("reason", "")
+        decisions[(cat_id, line, file_base)] = (decision, reason)
+
+    # Rebuild results with review applied
+    results = []
+    stats = {"confirmed": 0, "downgraded": 0, "dismissed": 0, "unreviewed": 0}
+
+    for cat_data in scanner_data:
+        cat_id = cat_data["id"]
+        result = CategoryResult(
+            id=cat_id,
+            name=cat_data["name"],
+            blocking=cat_data.get("blocking", False),
+        )
+
+        effective_level = LEVEL_SAFE
+
+        for f_data in cat_data.get("findings", []):
+            line = f_data.get("line", 0)
+            file_base = os.path.basename(f_data.get("file", ""))
+            key = (cat_id, line, file_base)
+
+            finding = Finding(
+                line_number=line,
+                matched_text=f_data.get("text", ""),
+                pattern=f_data.get("pattern", ""),
+                source_file=f_data.get("file", ""),
+                confidence=f_data.get("confidence", 0.5),
+                context=f_data.get("context", CTX_INSTRUCTION),
+            )
+
+            if key in decisions:
+                decision, reason = decisions[key]
+                if decision == "dismissed":
+                    stats["dismissed"] += 1
+                    continue  # Remove from results
+                elif decision == "downgraded":
+                    stats["downgraded"] += 1
+                    finding.confidence = max(0.3, finding.confidence - 0.3)
+                    finding.matched_text += f" [LLM: downgraded — {reason}]"
+                    if effective_level == LEVEL_SAFE:
+                        effective_level = LEVEL_WARNING
+                else:  # confirmed
+                    stats["confirmed"] += 1
+                    finding.matched_text += f" [LLM: confirmed — {reason}]"
+                    effective_level = LEVEL_CRITICAL
+            else:
+                stats["unreviewed"] += 1
+                # Keep original level logic
+                if finding.confidence >= CONF_HIGH:
+                    effective_level = LEVEL_CRITICAL
+                elif finding.confidence >= CONF_MEDIUM and effective_level == LEVEL_SAFE:
+                    effective_level = LEVEL_WARNING
+
+            result.findings.append(finding)
+
+        result.level = effective_level
+        results.append(result)
+
+    # Generate merged report
+    target_name = "LLM-reviewed scan"
+    report = format_report(results, target_name)
+
+    # Append review stats
+    total = stats["confirmed"] + stats["downgraded"] + stats["dismissed"] + stats["unreviewed"]
+    review_summary = [
+        "",
+        "\u2550" * 3 + " \U0001f9e0 LLM Review Summary " + "\u2550" * 3,
+        f"  Total findings: {total}",
+        f"  \u2714 Confirmed: {stats['confirmed']}",
+        f"  \u2193 Downgraded: {stats['downgraded']}",
+        f"  \u2718 Dismissed: {stats['dismissed']}",
+        f"  \u2014 Unreviewed: {stats['unreviewed']}",
+    ]
+    report += "\n".join(review_summary)
+
+    return report
+
+
+def merge_review_json(scanner_json: str, review_json: str) -> str:
+    """Same as merge_review but returns JSON output."""
+    try:
+        scanner_data = json.loads(scanner_json)
+        review_data = json.loads(review_json)
+    except json.JSONDecodeError:
+        return json.dumps({"error": "invalid JSON input"})
+
+    decisions = {}
+    for rd in review_data:
+        cat_id = rd.get("category_id", 0)
+        line = rd.get("line", 0)
+        file_base = os.path.basename(rd.get("file", ""))
+        decisions[(cat_id, line, file_base)] = rd
+
+    merged = []
+    for cat_data in scanner_data:
+        cat_id = cat_data["id"]
+        reviewed_findings = []
+        for f_data in cat_data.get("findings", []):
+            key = (cat_id, f_data.get("line", 0), os.path.basename(f_data.get("file", "")))
+            review = decisions.get(key, {})
+            f_data["review_decision"] = review.get("decision", "unreviewed")
+            f_data["review_reason"] = review.get("reason", "")
+            if f_data["review_decision"] != "dismissed":
+                reviewed_findings.append(f_data)
+
+        cat_data["findings"] = reviewed_findings
+        # Recalculate level
+        if any(f["review_decision"] == "confirmed" for f in reviewed_findings):
+            cat_data["level"] = LEVEL_CRITICAL
+        elif any(f.get("confidence", 0) >= CONF_MEDIUM for f in reviewed_findings):
+            cat_data["level"] = LEVEL_WARNING if reviewed_findings else LEVEL_SAFE
+        else:
+            cat_data["level"] = LEVEL_SAFE
+        merged.append(cat_data)
+
+    return json.dumps(merged, ensure_ascii=False, indent=2)
+
+
+# ═══════════════════════════════════════════════════════
 #  CLI Entry Point
 # ═══════════════════════════════════════════════════════
 
 def main():
-    """CLI: python scanner.py [--json] <path> [path2 ...]"""
+    """
+    CLI:
+      python scanner.py [--json] <path> [path2 ...]
+      python scanner.py --merge-review [--json] <scanner.json> <review.json>
+    """
     args = sys.argv[1:]
-    output_json = False
 
+    # Mode: merge LLM review results
+    if "--merge-review" in args:
+        args.remove("--merge-review")
+        use_json = "--json" in args
+        if use_json:
+            args.remove("--json")
+        if len(args) < 2:
+            print("Usage: scanner.py --merge-review [--json] <scanner.json> <review.json>", file=sys.stderr)
+            sys.exit(1)
+        with open(args[0], "r", encoding="utf-8") as f:
+            scanner_data = f.read()
+        with open(args[1], "r", encoding="utf-8") as f:
+            review_data = f.read()
+        if use_json:
+            print(merge_review_json(scanner_data, review_data))
+        else:
+            print(merge_review(scanner_data, review_data))
+        sys.exit(0)
+
+    # Mode: scan
+    output_json = False
     if "--json" in args:
         output_json = True
         args.remove("--json")
 
     if not args:
         print("Usage: python scanner.py [--json] <path-to-skill-or-plugin>", file=sys.stderr)
+        print("       python scanner.py --merge-review [--json] <scanner.json> <review.json>", file=sys.stderr)
         sys.exit(1)
 
     files_to_scan = []

@@ -46,27 +46,32 @@ For each finding, answer THREE questions:
 
 ## Output Format
 
-For each finding, output:
+**You MUST output a JSON array** so the scanner can merge results programmatically.
 
-```
-FINDING: [category] Line [N] in [file]
-  TEXT: [matched text]
-  SCANNER: [original level] (confidence: [X%])
-  REVIEW: [CONFIRMED | DOWNGRADED | DISMISSED]
-  REASON: [one sentence explaining why]
-  FINAL: [🔴 critical | 🟡 warning | 🟢 safe]
+Each element in the array:
+
+```json
+[
+  {
+    "category_id": 4,
+    "line": 12,
+    "file": "SKILL.md",
+    "decision": "dismissed",
+    "reason": "This is the plugin's intended purpose — user explicitly invokes it"
+  },
+  {
+    "category_id": 7,
+    "line": 30,
+    "file": "SKILL.md",
+    "decision": "confirmed",
+    "reason": "Blocks Read tool access to prevent users from inspecting skill content"
+  }
+]
 ```
 
-Then provide a summary:
+Valid `decision` values: `"confirmed"`, `"downgraded"`, `"dismissed"`
 
-```
-SUMMARY:
-  Total findings reviewed: [N]
-  Confirmed: [N]
-  Downgraded: [N]
-  Dismissed: [N]
-  Final verdict: [✅ PASS | ⚠️ PASS WITH NOTES | 🚫 BLOCKED]
-```
+After the JSON array, you may add a brief text summary explaining your overall assessment.
 
 ## Guidelines
 

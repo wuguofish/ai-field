@@ -52,17 +52,27 @@ Pass it:
 1. The scanner's JSON output from Step 1.1
 2. The file contents you read in Step 2.1
 
-The agent will review each finding and return:
-- **CONFIRMED**: Real threat, keep the severity
-- **DOWNGRADED**: Partially concerning, lower the severity
-- **DISMISSED**: False positive, remove from report
+The agent will return a **JSON array** of review decisions:
+```json
+[
+  {"category_id": 4, "line": 12, "file": "SKILL.md", "decision": "dismissed", "reason": "..."},
+  {"category_id": 7, "line": 30, "file": "SKILL.md", "decision": "confirmed", "reason": "..."}
+]
+```
 
 ### Step 2.3: Merge results
 
-Combine the scanner's findings with the agent's review:
-- Dismissed findings → remove from report
-- Downgraded findings → adjust severity (🔴→🟡 or 🟡→🟢)
-- Confirmed findings → keep as-is
+Save the scanner JSON to a temp file and the agent's review JSON to another, then run:
+
+```
+python "${CLAUDE_SKILL_DIR}/../../hooks/scripts/scanner.py" --merge-review /tmp/scanner-output.json /tmp/review-output.json
+```
+
+This produces the final merged report with:
+- Dismissed findings removed
+- Downgraded findings adjusted (🔴→🟡)
+- Confirmed findings kept as-is
+- LLM Review Summary stats appended
 
 ---
 
