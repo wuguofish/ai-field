@@ -1,0 +1,8 @@
+{
+  "name": "ai-field",
+  "description": "A.I. Field — 自動掃描 skill、plugin、MCP server 的安全性風險",
+  "version": "0.1.0",
+  "author": {
+    "name": "wuguofish"
+  }
+}
