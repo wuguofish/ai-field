@@ -18,9 +18,10 @@ INSTALL_PATTERNS = [
     # curl/wget piped to shell
     (r"curl\s.*\|\s*(?:ba)?sh", "Remote script execution (curl | sh)"),
     (r"wget\s.*\|\s*(?:ba)?sh", "Remote script execution (wget | sh)"),
-    # Downloading and executing scripts
-    (r"curl\s.*-o\s.*\.(?:sh|py|js)", "Downloading executable script"),
-    (r"wget\s.*\.(?:sh|py|js)", "Downloading executable script"),
+    # Downloading scripts: the saved file itself must end in a script extension,
+    # so package.json or a .tgz fetched alongside a .json read does not match
+    (r"curl\s.*-o\s+\S*\.(?:sh|py|js)\b(?![.\w])", "Downloading executable script"),
+    (r"wget\s.*\S*\.(?:sh|py|js)\b(?![.\w])", "Downloading executable script"),
 ]
 
 # Dangerous commands that should always be flagged
