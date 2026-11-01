@@ -16,13 +16,22 @@ INSTALL_PATTERNS = [
     # cp/copy to protected directories
     (r"(?:cp|copy)\s.*\.claude[/\\](?:skills|plugins|agents)", "Copy to Claude protected directory"),
     # curl/wget piped to shell
-    (r"curl\s.*\|\s*(?:ba)?sh", "Remote script execution (curl | sh)"),
-    (r"wget\s.*\|\s*(?:ba)?sh", "Remote script execution (wget | sh)"),
-    # Downloading scripts: the saved file itself must end in a script extension,
-    # so package.json or a .tgz fetched alongside a .json read does not match
-    (r"curl\s.*-o\s+\S*\.(?:sh|py|js)\b(?![.\w])", "Downloading executable script"),
-    (r"wget\s.*\S*\.(?:sh|py|js)\b(?![.\w])", "Downloading executable script"),
+    (r"curl\s.*\|\s*(?:ba)?sh\b", "Remote script execution (curl | sh)"),
+    (r"wget\s.*\|\s*(?:ba)?sh\b", "Remote script execution (wget | sh)"),
 ]
+
+# The extension must end the name, so .json, .jsp and .shtml are not scripts
+SCRIPT_EXTENSION = r"\.(?:sh|py|js)(?=[\"'?#]|\s|$)"
+
+# Checked one shell segment at a time: a script run by a later command in the
+# chain is not a download
+DOWNLOAD_PATTERNS = [
+    (r"\bcurl\b.*\s(?:-[a-z]*o|--output)[\s=]+[\"']?\S*" + SCRIPT_EXTENSION, "Downloading executable script"),
+    (r"\bwget\b.*" + SCRIPT_EXTENSION, "Downloading executable script"),
+]
+
+# Quoted strings are consumed whole, so only separators outside quotes split
+SHELL_SEPARATOR = re.compile(r"""("[^"]*"|'[^']*')|[;&|\n]+""")
 
 # Dangerous commands that should always be flagged
 DANGEROUS_PATTERNS = [
@@ -34,6 +43,30 @@ DANGEROUS_PATTERNS = [
     (r"dd\s+if=.*of=/dev/", "Direct device write with dd"),
     (r"chmod\s+-R\s+777\s+/", "Recursive world-writable permission on root"),
 ]
+
+
+def command_segments(command: str) -> list[str]:
+    """Split a command line on ;, &, | and newlines that sit outside quotes."""
+    segments, start = [], 0
+    for match in SHELL_SEPARATOR.finditer(command):
+        if match.group(1):
+            continue
+        segments.append(command[start:match.start()])
+        start = match.end()
+    segments.append(command[start:])
+    return segments
+
+
+def find_install_activity(command: str) -> str | None:
+    """Return the description of the first install rule the command matches."""
+    for pattern, desc in INSTALL_PATTERNS:
+        if re.search(pattern, command, re.IGNORECASE):
+            return desc
+    for segment in command_segments(command):
+        for pattern, desc in DOWNLOAD_PATTERNS:
+            if re.search(pattern, segment, re.IGNORECASE):
+                return desc
+    return None
 
 
 def make_deny_response(reason: str) -> dict:
@@ -81,16 +114,16 @@ def main():
             sys.exit(0)
 
     # Check installation-related commands → ASK
-    for pattern, desc in INSTALL_PATTERNS:
-        if re.search(pattern, command, re.IGNORECASE):
-            response = make_ask_response(
-                f"\U0001f6e1\ufe0f A.I. Field \u2014 Installation activity detected\n\n"
-                f"Command: {command[:200]}\n"
-                f"Detected: {desc}\n\n"
-                f"After installation, run /ai-field-scan to audit the installed content."
-            )
-            json.dump(response, sys.stdout, ensure_ascii=False)
-            sys.exit(0)
+    desc = find_install_activity(command)
+    if desc:
+        response = make_ask_response(
+            f"\U0001f6e1\ufe0f A.I. Field \u2014 Installation activity detected\n\n"
+            f"Command: {command[:200]}\n"
+            f"Detected: {desc}\n\n"
+            f"After installation, run /ai-field-scan to audit the installed content."
+        )
+        json.dump(response, sys.stdout, ensure_ascii=False)
+        sys.exit(0)
 
     # No match → allow
     sys.exit(0)
