@@ -31,7 +31,7 @@ Manually reviewing every skill before installation is tedious and error-prone. A
   ┌───────────────────────────────────────┐
   │  Layer 1: Automated Scanner           │
   │  ┌─────────────────────────────────┐  │
-  │  │ PreToolUse Hook                 │  │  ← Auto-intercept Write/Edit/Bash
+  │  │ PreToolUse Hook                 │  │  ← Auto-intercept Write/Edit/Bash/PowerShell
   │  │ 11-Category Pattern Scan        │  │  ← Context-aware + confidence scoring
   │  │ MCP Server Structural Analysis  │  │  ← JSON parsing of .mcp.json
   │  └─────────────────────────────────┘  │
@@ -219,7 +219,7 @@ ai-field/
 │   └── scripts/
 │       ├── scanner.py           # Core scanning engine (11 categories + MCP analysis)
 │       ├── intercept-install.py # Write/Edit hook — file & MCP interception
-│       └── intercept-bash.py    # Bash hook — command interception
+│       └── intercept-bash.py    # Bash/PowerShell hook — command interception
 ├── skills/
 │   └── ai-field-scan/
 │       └── SKILL.md             # Manual two-stage scan: /ai-field-scan
@@ -315,7 +315,7 @@ MIT
   ┌───────────────────────────────────────┐
   │  Layer 1：自動化掃描器                   │
   │  ┌─────────────────────────────────┐  │
-  │  │ PreToolUse Hook 攔截             │  │  ← 自動攔截 Write/Edit/Bash
+  │  │ PreToolUse Hook 攔截             │  │  ← 自動攔截 Write/Edit/Bash/PowerShell
   │  │ 11 大類別 Pattern 掃描            │  │  ← 上下文感知 + 信心分數
   │  │ MCP Server 結構化分析             │  │  ← 解析 .mcp.json
   │  └─────────────────────────────────┘  │
@@ -503,7 +503,7 @@ ai-field/
 │   └── scripts/
 │       ├── scanner.py           # 核心掃描引擎（11 大類別 + MCP 分析）
 │       ├── intercept-install.py # Write/Edit Hook — 檔案寫入 & MCP 攔截
-│       └── intercept-bash.py    # Bash Hook — 指令攔截
+│       └── intercept-bash.py    # Bash/PowerShell Hook — 指令攔截
 ├── skills/
 │   └── ai-field-scan/
 │       └── SKILL.md             # 手動兩階段掃描：/ai-field-scan
